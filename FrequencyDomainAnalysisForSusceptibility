@@ -1,0 +1,401 @@
+# -*- coding: utf-8 -*-
+
+"""
+Transform autocorrelation functions into frequency-domain
+susceptibility spectra and optionally fit the averaged spectrum to a
+Havriliak-Negami form.
+
+The code accepts both:
+    *_QE_ACFvals.csv       QE-averaged ACF
+    *_final_ACFvals.csv    single-molecule ACFs
+
+HN fitting uses weighted-linear fitting by default. Log-amplitude
+fitting is available as an option.
+
+Outputs:
+    *_ChiLossData_omega.csv          χ''(ω) data
+    *_ChiLoss_Average_omega.png      χ''(ω) plot
+    *_HNfit_params.csv               HN fit parameters
+    *_HNfit_semilogx.png             HN fit plot
+"""
+
+# ============================================================
+# Imports
+# ============================================================
+
+from pathlib import Path
+
+import numpy as np
+import pandas as pd
+import matplotlib.pyplot as plt
+
+from scipy.integrate import simpson
+from scipy.optimize import curve_fit, least_squares
+from joblib import Parallel, delayed
+
+# ============================================================
+# User Inputs
+# ============================================================
+
+# Input ACF file:
+#   - use *_QE_ACFvals.csv for QE susceptibility
+#   - use *_final_ACFvals.csv for molecule-averaged susceptibility
+
+ACF_FILE = r"C:\path\to\ACFvals.csv"
+
+# Time between frames (s)
+TBF = 0.4
+
+N_JOBS = -1
+DO_HN_FIT = True
+
+# HN fitting method:
+#   "weighted"  default weighted-linear fit
+#   "log"       log-amplitude fit
+HN_FIT_METHOD = "weighted"
+
+SAVE_PREFIX = str(
+    Path(ACF_FILE).with_suffix("")
+)
+
+# ============================================================
+# Helper Functions
+# ============================================================
+
+def load_acf_file(acf_file):
+
+    acf = pd.read_csv(acf_file, header=None).to_numpy()
+
+    if acf.ndim == 1:
+        acf = acf.reshape(-1, 1)
+
+    if acf.shape[1] == 1:
+        acf_type = "QE"
+    else:
+        acf_type = "Molecule-average"
+
+    return acf, acf_type
+
+def chi_from_acf(acf, time, dt, omega):
+
+    mask = np.isfinite(acf)
+
+    acf = acf[mask]
+    t = time[mask]
+
+    if len(acf) < 10:
+        return np.full_like(omega, np.nan)
+
+    if not np.isfinite(acf[0]) or acf[0] < 0.3:
+        return np.full_like(omega, np.nan)
+
+    chi_t = -np.gradient(acf, dt)
+
+    chi = np.array(
+        [
+            simpson(
+                y=chi_t * np.sin(w * t),
+                x=t
+            )
+            for w in omega
+        ]
+    )
+
+    return chi
+
+def hn_imag(omega, Delta, tau, alpha, gamma_HN, b):
+
+    z = (1j * omega * tau) ** alpha
+
+    return -np.imag(
+        Delta / (1 + z) ** gamma_HN
+    ) + b
+
+def tau_HN_peak(tau0, alpha, gamma_HN):
+
+    return tau0 * (
+        np.sin(np.pi * alpha * gamma_HN / (2 * (1 + gamma_HN)))
+        / np.sin(np.pi * alpha / (2 * (1 + gamma_HN)))
+    ) ** (1 / alpha)
+
+def r2_lin(y, yhat):
+
+    ss_res = np.sum((y - yhat) ** 2)
+    ss_tot = np.sum((y - np.mean(y)) ** 2)
+
+    if ss_tot <= 0:
+        return np.nan
+
+    return 1 - ss_res / ss_tot
+
+def residuals_log(p, w, y):
+
+    model = hn_imag(w, *p)
+
+    eps = max(
+        1e-12,
+        1e-6 * np.nanmax(y)
+    )
+
+    model_pos = np.maximum(model, eps)
+
+    return (
+        np.log10(model_pos)
+        - np.log10(y)
+    )
+
+# ============================================================
+# Load ACF Data
+# ============================================================
+
+ACF_arr, acf_type = load_acf_file(ACF_FILE)
+
+n_lags, n_acf = ACF_arr.shape
+
+time = (np.arange(n_lags)) * TBF
+dt = TBF
+
+print(
+    f"Loaded {acf_type} ACF file: "
+    f"{n_acf} curve(s), {n_lags} points"
+)
+
+# ============================================================
+# Frequency Grid
+# ============================================================
+
+omega_min = 2 * np.pi / time[-1]
+omega_max = 0.95 * np.pi / dt
+
+omega = np.exp(
+    np.linspace(
+        np.log(omega_min),
+        np.log(omega_max),
+        64
+    )
+)
+
+# ============================================================
+# Chi Loss Transform
+# ============================================================
+
+results = Parallel(
+    n_jobs=N_JOBS,
+    verbose=5
+)(
+    delayed(chi_from_acf)(
+        ACF_arr[:, i],
+        time,
+        dt,
+        omega
+    )
+    for i in range(n_acf)
+)
+
+Chi_all = np.column_stack(results)
+
+valid_mask = np.all(
+    np.isfinite(Chi_all),
+    axis=0
+)
+
+valid_count = np.sum(valid_mask)
+
+Chi_avg = np.nanmean(
+    Chi_all,
+    axis=1
+)
+
+print(
+    f"Transformed {valid_count}/{n_acf} "
+    f"ACF curve(s) to chi loss"
+)
+
+# ============================================================
+# Save Chi Loss Data
+# ============================================================
+
+df_out = pd.DataFrame(
+    {
+        "omega_rad_per_s": omega,
+        "Chi_avg": Chi_avg
+    }
+)
+
+for i in range(n_acf):
+
+    df_out[f"Chi_curve_{i + 1}"] = Chi_all[:, i]
+
+out_csv = SAVE_PREFIX + "_ChiLossData_omega.csv"
+
+df_out.to_csv(out_csv, index=False)
+
+print(f"Saved chi loss data to:\n{out_csv}")
+
+# ============================================================
+# Plot Chi Loss
+# ============================================================
+
+plt.figure(figsize=(7, 5))
+
+plt.semilogx(
+    omega,
+    Chi_avg,
+    "-k",
+    lw=2,
+    label=f"{acf_type} susceptibility"
+)
+
+plt.xlabel(r"Angular frequency $\omega$ (rad/s)")
+plt.ylabel(r"$\chi''(\omega)$ (a.u.)")
+
+plt.title(f"{acf_type} Loss Spectrum")
+
+plt.legend()
+plt.tight_layout()
+
+fig_path = SAVE_PREFIX + "_ChiLoss_Average_omega.png"
+
+plt.savefig(fig_path, dpi=300)
+plt.show()
+
+print(f"Saved chi loss plot to:\n{fig_path}")
+
+# ============================================================
+# HN Fit
+# ============================================================
+
+if DO_HN_FIT:
+
+    print(f"Performing HN fit using {HN_FIT_METHOD} method...")
+
+    mask = (
+        np.isfinite(omega)
+        & np.isfinite(Chi_avg)
+        & (omega > 0)
+        & (Chi_avg > 0)
+    )
+
+    omega_fit_data = omega[mask]
+    chi_fit_data = Chi_avg[mask]
+
+    omega_peak_guess = omega_fit_data[np.argmax(chi_fit_data)]
+
+    tau0 = 1.0 / max(omega_peak_guess, 1e-9)
+    Delta0 = np.max(chi_fit_data) - np.min(chi_fit_data)
+    b0 = max(0.0, np.min(chi_fit_data) * 0.1)
+
+    p0 = [Delta0, tau0, 0.7, 0.7, b0]
+
+    bounds = (
+        [1e-12, 1e-12, 0.05, 0.05, 0.0],
+        [np.inf, 1e8, 1.0, 1.0, np.inf]
+    )
+
+    sigma = chi_fit_data.copy()
+    sigma[sigma <= 0] = np.median(chi_fit_data)
+
+    if HN_FIT_METHOD.lower() == "log":
+
+        res = least_squares(
+            residuals_log,
+            p0,
+            bounds=bounds,
+            args=(omega_fit_data, chi_fit_data),
+            max_nfev=200000
+        )
+
+        popt = res.x
+        fit_label = "log_amplitude"
+
+    else:
+
+        popt, _ = curve_fit(
+            hn_imag,
+            omega_fit_data,
+            chi_fit_data,
+            p0=p0,
+            bounds=bounds,
+            sigma=sigma,
+            absolute_sigma=False,
+            maxfev=200000
+        )
+
+        fit_label = "weighted_linear"
+
+    w_smooth = np.logspace(
+        np.log10(omega_fit_data.min()),
+        np.log10(omega_fit_data.max()),
+        2048
+    )
+
+    chi_fit = hn_imag(w_smooth, *popt)
+
+    tau_peak = tau_HN_peak(
+        popt[1],
+        popt[2],
+        popt[3]
+    )
+
+    r2 = r2_lin(
+        chi_fit_data,
+        hn_imag(omega_fit_data, *popt)
+    )
+
+    params_df = pd.DataFrame(
+        {
+            "fit_type": [fit_label],
+            "Delta": [popt[0]],
+            "tau0_s": [popt[1]],
+            "alpha": [popt[2]],
+            "gamma": [popt[3]],
+            "baseline_b": [popt[4]],
+            "tau_peak_s": [tau_peak],
+            "omega_tau_rad_s": [1 / popt[1]],
+            "R2_linear": [r2]
+        }
+    )
+
+    out_hn = SAVE_PREFIX + "_HNfit_params.csv"
+
+    params_df.to_csv(out_hn, index=False)
+
+    print(f"Saved HN fit parameters to:\n{out_hn}")
+
+    plt.figure(figsize=(5, 5))
+
+    plt.semilogx(
+        omega_fit_data,
+        chi_fit_data,
+        "o",
+        ms=3,
+        label=f"{acf_type} susceptibility"
+    )
+
+    plt.semilogx(
+        w_smooth,
+        chi_fit,
+        "-",
+        lw=2,
+        label=(
+            f"HN {fit_label}: "
+            f"alpha={popt[2]:.2f}, "
+            f"gamma={popt[3]:.2f}, "
+            f"tau_p={tau_peak:.3g} s"
+        )
+    )
+
+    plt.xlabel(r"Angular frequency $\omega$ (rad/s)")
+    plt.ylabel(r"$\chi''(\omega)$ (a.u.)")
+
+    plt.title(f"{acf_type} HN Fit")
+
+    plt.legend()
+    plt.tight_layout()
+
+    fig_hn = SAVE_PREFIX + "_HNfit_semilogx.png"
+
+    plt.savefig(fig_hn, dpi=300)
+    plt.show()
+
+    print(f"Saved HN fit plot to:\n{fig_hn}")
