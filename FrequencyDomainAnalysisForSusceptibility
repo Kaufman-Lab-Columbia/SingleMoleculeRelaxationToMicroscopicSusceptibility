@@ -13,8 +13,8 @@ HN fitting uses weighted-linear fitting by default. Log-amplitude
 fitting is available as an option.
 
 Outputs:
-    *_ChiLossData_omega.csv          χ''(ω) data
-    *_ChiLoss_Average_omega.png      χ''(ω) plot
+    *_Chi_Data_omega.csv          χ''(ω) data
+    *_Chi_Average_omega.png      χ''(ω) plot
     *_HNfit_params.csv               HN fit parameters
     *_HNfit_semilogx.png             HN fit plot
 """
@@ -176,7 +176,7 @@ omega = np.exp(
 )
 
 # ============================================================
-# Chi Loss Transform
+# Chi Transform
 # ============================================================
 
 results = Parallel(
@@ -208,11 +208,11 @@ Chi_avg = np.nanmean(
 
 print(
     f"Transformed {valid_count}/{n_acf} "
-    f"ACF curve(s) to chi loss"
+    f"ACF curve(s) to chi"
 )
 
 # ============================================================
-# Save Chi Loss Data
+# Save Chi Data
 # ============================================================
 
 df_out = pd.DataFrame(
@@ -226,14 +226,14 @@ for i in range(n_acf):
 
     df_out[f"Chi_curve_{i + 1}"] = Chi_all[:, i]
 
-out_csv = SAVE_PREFIX + "_ChiLossData_omega.csv"
+out_csv = SAVE_PREFIX + "_Chi_Data_omega.csv"
 
 df_out.to_csv(out_csv, index=False)
 
-print(f"Saved chi loss data to:\n{out_csv}")
+print(f"Saved chi data to:\n{out_csv}")
 
 # ============================================================
-# Plot Chi Loss
+# Plot Chi
 # ============================================================
 
 plt.figure(figsize=(7, 5))
@@ -249,17 +249,17 @@ plt.semilogx(
 plt.xlabel(r"Angular frequency $\omega$ (rad/s)")
 plt.ylabel(r"$\chi''(\omega)$ (a.u.)")
 
-plt.title(f"{acf_type} Loss Spectrum")
+plt.title(f"{acf_type} Spectrum")
 
 plt.legend()
 plt.tight_layout()
 
-fig_path = SAVE_PREFIX + "_ChiLoss_Average_omega.png"
+fig_path = SAVE_PREFIX + "_Chi_Average_omega.png"
 
 plt.savefig(fig_path, dpi=300)
 plt.show()
 
-print(f"Saved chi loss plot to:\n{fig_path}")
+print(f"Saved chi plot to:\n{fig_path}")
 
 # ============================================================
 # HN Fit
