@@ -1,6 +1,6 @@
 # SingleMoleculeRelaxationToMicroscopicSusceptibility
 
-Python/Jupyter tools for transforming single-molecule rotational relaxation trajectories into frequency-domain susceptibility spectra.
+Python/Jupyter tools for transforming single-molecule linear dichroism trajectories into frequency-domain susceptibility spectra.
 
 ## Repository Structure
 
