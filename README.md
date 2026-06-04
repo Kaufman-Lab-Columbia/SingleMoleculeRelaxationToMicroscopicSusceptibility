@@ -1,1 +1,1 @@
-# SingleMoleculeRelaxationToMiscroscopicSusceptibility
+# SingleMoleculeRelaxationToMicroscopicSusceptibility
