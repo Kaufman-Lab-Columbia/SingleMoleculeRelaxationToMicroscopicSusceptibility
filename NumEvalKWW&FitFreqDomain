@@ -1,0 +1,325 @@
+# -*- coding: utf-8 -*-
+
+"""
+Generate a KWW autocorrelation function, transform it into a
+frequency-domain susceptibility spectrum, and fit the spectrum
+to a Havriliak-Negami form.
+
+HN fitting uses weighted-linear fitting by default. Log-amplitude
+fitting is available as an option.
+"""
+
+# ============================================================
+# Imports
+# ============================================================
+
+import numpy as np
+import matplotlib.pyplot as plt
+
+from scipy.integrate import simpson
+from scipy.optimize import curve_fit, least_squares
+
+# ============================================================
+# User Inputs
+# ============================================================
+
+BETA = 0.5
+TAU = 1.0
+DT = 0.02
+N_STEPS = 10000
+
+NOISE_LEVEL = 0.0
+N_TRAJ = 1
+SEED = None
+
+N_OMEGA = 64
+
+HN_FIT_METHOD = "weighted"   # "weighted" or "log"
+
+# ============================================================
+# Helper Functions
+# ============================================================
+
+def generate_kww_trajectory(beta, tau, dt, n_steps, noise_level, n_traj, seed):
+
+    rng = np.random.default_rng(seed)
+
+    time = np.arange(n_steps) * dt
+    acf = np.exp(-((time / tau) ** beta))
+
+    trajs = np.zeros((n_traj, n_steps))
+
+    for i in range(n_traj):
+
+        noise = noise_level * rng.normal(size=n_steps)
+        trajs[i] = acf + noise
+
+    return time, acf, trajs
+
+def make_omega_grid(time, dt, n_omega):
+
+    omega_min = 2 * np.pi / time[-1]
+    omega_max = 0.95 * np.pi / dt
+
+    return np.exp(
+        np.linspace(
+            np.log(omega_min),
+            np.log(omega_max),
+            n_omega
+        )
+    )
+
+def chi_from_acf(acf, time, dt, omega):
+
+    acf = np.asarray(acf, dtype=float)
+    time = np.asarray(time, dtype=float)
+
+    mask = np.isfinite(acf)
+
+    acf = acf[mask]
+    time = time[mask]
+
+    if len(acf) < 10 or acf[0] < 0.3:
+        return np.full_like(omega, np.nan)
+
+    chi_t = -np.gradient(acf, dt)
+
+    chi = np.array(
+        [
+            simpson(
+                y=chi_t * np.sin(w * time),
+                x=time
+            )
+            for w in omega
+        ]
+    )
+
+    return chi
+
+def hn_imag(omega, Delta, tau, alpha, gamma_hn, b):
+
+    z = (1j * omega * tau) ** alpha
+
+    return -np.imag(
+        Delta / (1 + z) ** gamma_hn
+    ) + b
+
+def tau_HN_peak(tau0, alpha, gamma_hn):
+
+    return tau0 * (
+        np.sin(np.pi * alpha * gamma_hn / (2 * (1 + gamma_hn)))
+        / np.sin(np.pi * alpha / (2 * (1 + gamma_hn)))
+    ) ** (1 / alpha)
+
+def r2_score(y, yfit):
+
+    ss_res = np.sum((y - yfit) ** 2)
+    ss_tot = np.sum((y - np.mean(y)) ** 2)
+
+    if ss_tot <= 0:
+        return np.nan
+
+    return 1 - ss_res / ss_tot
+
+def residuals_log(params, omega, chi):
+
+    model = hn_imag(omega, *params)
+
+    eps = max(
+        1e-12,
+        1e-6 * np.nanmax(chi)
+    )
+
+    model_pos = np.maximum(model, eps)
+
+    return np.log10(model_pos) - np.log10(chi)
+
+def fit_hn(omega, chi, method="weighted"):
+
+    mask = (
+        np.isfinite(omega)
+        & np.isfinite(chi)
+        & (omega > 0)
+        & (chi > 0)
+    )
+
+    omega_fit = omega[mask]
+    chi_fit_data = chi[mask]
+
+    omega_peak_guess = omega_fit[np.argmax(chi_fit_data)]
+
+    tau0 = 1.0 / max(omega_peak_guess, 1e-12)
+    Delta0 = np.max(chi_fit_data) - np.min(chi_fit_data)
+    b0 = max(0.0, np.min(chi_fit_data) * 0.05)
+
+    p0 = [Delta0, tau0, 0.7, 0.7, b0]
+
+    bounds = (
+        [1e-12, 1e-12, 0.05, 0.05, 0.0],
+        [np.inf, 1e8, 1.0, 1.0, np.inf]
+    )
+
+    if method.lower() == "log":
+
+        res = least_squares(
+            residuals_log,
+            p0,
+            bounds=bounds,
+            args=(omega_fit, chi_fit_data),
+            max_nfev=200000
+        )
+
+        popt = res.x
+        fit_label = "log_amplitude"
+
+    else:
+
+        sigma = chi_fit_data.copy()
+        sigma[sigma <= 0] = np.median(chi_fit_data)
+
+        popt, _ = curve_fit(
+            hn_imag,
+            omega_fit,
+            chi_fit_data,
+            p0=p0,
+            bounds=bounds,
+            sigma=sigma,
+            absolute_sigma=False,
+            maxfev=200000
+        )
+
+        fit_label = "weighted_linear"
+
+    chi_fit = hn_imag(omega_fit, *popt)
+
+    Delta, tau, alpha, gamma_hn, b = popt
+
+    tau_peak = tau_HN_peak(
+        tau,
+        alpha,
+        gamma_hn
+    )
+
+    r2 = r2_score(
+        chi_fit_data,
+        chi_fit
+    )
+
+    return {
+        "fit_label": fit_label,
+        "omega_fit": omega_fit,
+        "chi_fit": chi_fit,
+        "params": popt,
+        "tau_peak": tau_peak,
+        "r2": r2
+    }
+
+# ============================================================
+# Run Analysis
+# ============================================================
+
+time, acf, trajs = generate_kww_trajectory(
+    beta=BETA,
+    tau=TAU,
+    dt=DT,
+    n_steps=N_STEPS,
+    noise_level=NOISE_LEVEL,
+    n_traj=N_TRAJ,
+    seed=SEED
+)
+
+omega = make_omega_grid(
+    time,
+    DT,
+    N_OMEGA
+)
+
+chi = chi_from_acf(
+    acf,
+    time,
+    DT,
+    omega
+)
+
+fit = fit_hn(
+    omega,
+    chi,
+    method=HN_FIT_METHOD
+)
+
+Delta, tau, alpha, gamma_hn, b = fit["params"]
+
+print(f"\n===== HN fit: {fit['fit_label']} =====")
+print(f"Delta    = {Delta:.6g}")
+print(f"tau      = {tau:.6g} s")
+print(f"alpha    = {alpha:.6g}")
+print(f"gamma    = {gamma_hn:.6g}")
+print(f"b        = {b:.6g}")
+print(f"tau_peak = {fit['tau_peak']:.6g} s")
+print(f"R^2      = {fit['r2']:.6g}")
+
+# ============================================================
+# Plot ACF
+# ============================================================
+
+plt.figure(figsize=(6, 4))
+
+for traj in trajs:
+
+    plt.semilogx(
+        time[1:],
+        traj[1:],
+        alpha=0.5
+    )
+
+plt.semilogx(
+    time[1:],
+    acf[1:],
+    "k",
+    lw=2,
+    label="True KWW"
+)
+
+plt.xticks(fontsize=14)
+plt.yticks(fontsize=14)
+
+plt.xlabel("t", fontsize=16)
+plt.ylabel("C(t)", fontsize=16)
+
+plt.legend()
+plt.tight_layout()
+plt.show()
+
+# ============================================================
+# Plot Susceptibility
+# ============================================================
+
+plt.figure(figsize=(6, 4))
+
+plt.semilogx(
+    omega,
+    chi,
+    "o",
+    ms=5,
+    label="KWW transform"
+)
+
+plt.semilogx(
+    fit["omega_fit"],
+    fit["chi_fit"],
+    "-",
+    lw=2,
+    label=(
+        f"HN {fit['fit_label']}"
+    )
+)
+
+plt.xticks(fontsize=14)
+plt.yticks(fontsize=14)
+
+plt.xlabel(r"$\omega$", fontsize=16)
+plt.ylabel(r"$\chi''(\omega)$", fontsize=16)
+
+plt.legend()
+plt.tight_layout()
+plt.show()
