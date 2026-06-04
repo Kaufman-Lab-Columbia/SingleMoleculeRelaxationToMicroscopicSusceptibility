@@ -1,0 +1,447 @@
+"""
+Compute autocorrelation functions, perform single-molecule
+KWW fitting, and calculate QE-averaged relaxation parameters.
+
+The default autocorrelation calculation uses the FFT-based
+implementation from statsmodels for computational efficiency.
+
+An explicit autocorrelation implementation is also included for
+validation.
+
+
+Outputs:
+    *_ACFvals.csv              Autocorrelation functions
+    *_final_ACFvals.csv        ACFs passing KWW fit criteria
+    *_final_KWWfit.csv         Single-molecule KWW parameters
+    *_final_KWWcurves.csv      Single-molecule KWW fit curves
+    *_QE_ACFvals.csv           QE-averaged ACF
+    *_QE_kwwfit_results.csv    QE KWW fit parameters
+    *_QE_KWWcurve.csv          QE KWW fit curve
+"""
+
+# ============================================================
+# Imports
+# ============================================================
+
+from pathlib import Path
+
+import numpy as np
+import pandas as pd
+
+from scipy import optimize, special
+from sklearn.metrics import r2_score
+
+import statsmodels.tsa.stattools as smt
+from joblib import Parallel, delayed
+
+
+# ============================================================
+# User Inputs
+# ============================================================
+
+# Input CSV:
+#   - one molecule per column
+#   - no header
+#   - no time column
+
+CSV_PATH = r"C:\Users\syw\Desktop\examine\10p00mW_2ch_3Pregain_2uL_pPDI_200uL_PS168K_3KRPM_0p2sEXP_0p4sTBF_200EM_set374p2K_10kframes_1_dricor_bsub_LD_values.csv"
+
+# Time between frames (s)
+TBF = 0.4
+
+# Default: FFT ACF
+# Set True to use explicit ACF calculation
+USE_EXPLICIT_ACF = False
+
+# ============================================================
+# Fitting Parameters
+# ============================================================
+
+MIN_POINTS = 5       # minimum points used for fitting
+
+ACF_INIT_MIN = 0.3   # minimum first ACF value
+ACF_FINAL_MIN = 0.1  # truncate fit below this value
+
+R2_CUTOFF = 0.90     # minimum fit quality
+
+EPS_NEAR_TWO = 1e-7  # reject parameters at upper bound
+TAU_MIN_MULT = 2.0   # tau_fit must exceed 2 × TBF
+
+# ============================================================
+# Helper Functions
+# ============================================================
+
+def create_saveto_filepath(movie_filepath, suffix):
+
+    return movie_filepath.with_name(movie_filepath.stem + suffix)
+
+
+def KWW(t, A, tau_fit, beta):
+
+    return A * np.exp(-((t / tau_fit) ** beta))
+
+# ============================================================
+# ACF Calculation
+# ============================================================
+
+def compute_ACF(data):
+
+    if USE_EXPLICIT_ACF:
+        return compute_ACF_explicit(data)
+
+    return compute_ACF_FFT(data)
+
+def compute_ACF_FFT(data):
+
+    num_frames, num_feats = data.shape
+    n_lags = num_frames - 1
+
+    ACF = np.full((n_lags, num_feats), np.nan)
+
+    for i in range(num_feats):
+
+        try:
+
+            vals = smt.acf(
+                data[:, i],
+                adjusted=False,
+                nlags=n_lags,
+                fft=True,
+                missing="conservative"
+            )
+
+            ACF[:, i] = vals[1:]
+
+        except Exception:
+            continue
+
+    return ACF
+
+def compute_ACF_explicit(data, n_jobs=-1):
+
+    num_frames, num_feats = data.shape
+    n_lags = num_frames - 1
+
+    def single_acf(i):
+
+        x = np.asarray(data[:, i], float)
+
+        try:
+
+            x = x - np.nanmean(x)
+            n = len(x)
+
+            acf = np.full(n, np.nan)
+
+            for lag in range(n):
+
+                mask = (
+                    np.isfinite(x[: n - lag])
+                    & np.isfinite(x[lag:])
+                )
+
+                if np.any(mask):
+
+                    a = x[: n - lag][mask]
+                    b = x[lag:][mask]
+
+                    acf[lag] = np.mean(a * b)
+
+            acf = acf / acf[0]
+
+            out = np.full(n_lags, np.nan)
+            out[:] = acf[1:]
+
+            return out
+
+        except Exception:
+            return np.full(n_lags, np.nan)
+
+    ACF_list = Parallel(
+        n_jobs=n_jobs,
+        verbose=5
+    )(
+        delayed(single_acf)(i)
+        for i in range(num_feats)
+    )
+
+    return np.column_stack(ACF_list)
+
+# ============================================================
+# KWW Fitting
+# ============================================================
+
+def kww_fit_single(acf_i, x_data, num_frames, tbf):
+
+    res = np.full(5, np.nan)
+    curve = np.full_like(x_data, np.nan, dtype=float)
+
+    if not np.isfinite(acf_i[0]) or acf_i[0] < ACF_INIT_MIN:
+        return res, curve
+
+    n_lags = len(acf_i)
+    last = n_lags
+
+    for j in range(n_lags):
+
+        if (not np.isfinite(acf_i[j])) or (acf_i[j] < ACF_FINAL_MIN):
+            last = j
+            break
+
+    if last < MIN_POINTS:
+        return res, curve
+
+    y = acf_i[:last]
+    x = x_data[:last]
+
+    tau_init_idx = np.argmax(acf_i < 0.4)
+    tau_init = (tau_init_idx + 1) * tbf if tau_init_idx > 0 else 10 * tbf
+
+    p0 = [1.0, tau_init, 1.0]
+
+    lower = [0.3, tbf, 0.01]
+    upper = [2.0, (num_frames / 2) * tbf, 2.0]
+
+    try:
+
+        params, _ = optimize.curve_fit(
+            KWW,
+            x,
+            y,
+            p0=p0,
+            bounds=(lower, upper),
+            maxfev=3000
+        )
+
+        y_pred = KWW(x, *params)
+        r2 = r2_score(y, y_pred)
+
+    except Exception:
+        return res, curve
+
+    A, tau_fit, beta = params
+
+    if r2 < R2_CUTOFF:
+        return res, curve
+
+    if abs(A - 2.0) < EPS_NEAR_TWO or abs(beta - 2.0) < EPS_NEAR_TWO:
+        return res, curve
+
+    if tau_fit < TAU_MIN_MULT * tbf:
+        return res, curve
+
+    tau_c = (tau_fit / beta) * special.gamma(1.0 / beta)
+
+    res = np.array([A, tau_c, tau_fit, beta, r2])
+    curve = KWW(x_data, *params)
+
+    return res, curve
+
+def kww_fit_all(ACF, tbf, n_jobs=-1):
+
+    n_lags, num_feats = ACF.shape
+
+    num_frames = n_lags + 1
+    x_data = (np.arange(n_lags) + 1) * tbf
+
+    results = Parallel(
+        n_jobs=n_jobs,
+        verbose=5
+    )(
+        delayed(kww_fit_single)(
+            ACF[:, i],
+            x_data,
+            num_frames,
+            tbf
+        )
+        for i in range(num_feats)
+    )
+
+    full_results = np.full((num_feats, 5), np.nan)
+    curves = np.full((n_lags, num_feats), np.nan)
+
+    for i, (res, curve) in enumerate(results):
+
+        full_results[i] = res
+        curves[:, i] = curve
+
+    return full_results, curves, x_data
+
+# ============================================================
+# QE Analysis
+# ============================================================
+
+def QE_calc_from_results(ACF, full_results, tbf, num_frames):
+
+    n_lags = ACF.shape[0]
+
+    good_idx = np.where(np.isfinite(full_results[:, 0]))[0]
+    full_time = (np.arange(n_lags) + 1) * tbf
+
+    if good_idx.size == 0:
+
+        return (
+            np.full(n_lags, np.nan),
+            [np.nan, np.nan, np.nan, np.nan, np.nan],
+            (full_time, np.full(n_lags, np.nan))
+        )
+
+    QE_ACF = np.nanmean(ACF[:, good_idx], axis=1)
+
+    below = np.where(QE_ACF < 0.1)[0]
+    QE_fin = int(below[0]) if below.size > 0 else n_lags
+    QE_fin = max(QE_fin, 2)
+
+    x_fit = full_time[:QE_fin]
+    y_fit = QE_ACF[:QE_fin]
+
+    tau_init_loc = np.argmax(y_fit < 0.4)
+    tau_init = (tau_init_loc + 1) * tbf if tau_init_loc > 0 else tbf
+
+    p0 = [1.0, tau_init, 1.0]
+
+    lower = [0.01, tbf, 0.01]
+    upper = [2.0, (num_frames / 2) * tbf, 2.0]
+
+    try:
+
+        params, _ = optimize.curve_fit(
+            KWW,
+            x_fit,
+            y_fit,
+            p0=p0,
+            bounds=(lower, upper),
+            maxfev=10000
+        )
+
+        r2 = r2_score(y_fit, KWW(x_fit, *params))
+
+        A, tau_fit, beta = params
+        tau_c = (tau_fit / beta) * special.gamma(1.0 / beta)
+
+        qe_curve = KWW(full_time, *params)
+
+    except Exception:
+
+        A = tau_c = tau_fit = beta = r2 = np.nan
+        qe_curve = np.full(n_lags, np.nan)
+
+    return QE_ACF, [A, tau_c, tau_fit, beta, r2], (full_time, qe_curve)
+
+# ============================================================
+# Save Results
+# ============================================================
+
+def analyze_ACF(ACF, movie_filepath, tbf, num_frames):
+
+    full_results, curves, time_axis = kww_fit_all(ACF, tbf)
+
+    good_idx = np.where(np.isfinite(full_results[:, 0]))[0]
+
+    if good_idx.size == 0:
+        print("No molecules passed filtering.")
+        return
+
+    filtered_ACF = ACF[:, good_idx]
+
+    np.savetxt(
+        create_saveto_filepath(movie_filepath, "_final_ACFvals.csv"),
+        filtered_ACF,
+        delimiter=","
+    )
+
+    np.savetxt(
+        create_saveto_filepath(movie_filepath, "_final_KWWfit.csv"),
+        full_results,
+        delimiter=",",
+        header="A,tau_c,tau_fit,beta,R2",
+        comments=""
+    )
+
+    df_curves = pd.DataFrame(
+        curves,
+        columns=[f"Molecule_{i + 1}" for i in range(curves.shape[1])]
+    )
+
+    df_curves.insert(0, "Time_s", time_axis)
+
+    df_curves.to_csv(
+        create_saveto_filepath(movie_filepath, "_final_KWWcurves.csv"),
+        index=False
+    )
+
+    QE_ACF, QE_params, (qe_time, qe_curve) = QE_calc_from_results(
+        ACF,
+        full_results,
+        tbf,
+        num_frames
+    )
+
+    np.savetxt(
+        create_saveto_filepath(movie_filepath, "_QE_ACFvals.csv"),
+        QE_ACF,
+        delimiter=","
+    )
+
+    np.savetxt(
+        create_saveto_filepath(movie_filepath, "_QE_kwwfit_results.csv"),
+        np.array(QE_params).reshape(1, -1),
+        delimiter=",",
+        header="A,tau_c,tau_fit,beta,R2",
+        comments=""
+    )
+
+    df_qe = pd.DataFrame(
+        {
+            "Time_s": qe_time,
+            "QE_KWW": qe_curve
+        }
+    )
+
+    df_qe.to_csv(
+        create_saveto_filepath(movie_filepath, "_QE_KWWcurve.csv"),
+        index=False
+    )
+
+# ============================================================
+# Run Analysis
+# ============================================================
+
+def main():
+
+    movie_filepath = Path(CSV_PATH)
+
+    df = pd.read_csv(movie_filepath, header=None)
+    data = df.to_numpy(float)
+
+    num_frames, num_feats = data.shape
+
+    print(
+        f"Loaded {movie_filepath.name}: "
+        f"frames={num_frames}, molecules={num_feats}"
+    )
+
+    ACF = compute_ACF(data)
+
+    cols = [f"Molecule_{i + 1}" for i in range(num_feats)]
+    time_axis = (np.arange(1, ACF.shape[0] + 1) * TBF)
+
+    df_acf = pd.DataFrame(ACF, columns=cols)
+    df_acf.insert(0, "Lag_time_s", time_axis)
+
+    df_acf.to_csv(
+        create_saveto_filepath(movie_filepath, "_ACFvals.csv"),
+        index=False
+    )
+
+    analyze_ACF(
+        ACF,
+        movie_filepath,
+        TBF,
+        num_frames
+    )
+
+    print("Analysis complete.")
+
+if __name__ == "__main__":
+    main()
