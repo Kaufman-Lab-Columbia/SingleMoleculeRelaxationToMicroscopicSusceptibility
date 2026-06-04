@@ -44,7 +44,7 @@ from joblib import Parallel, delayed
 #   - no header
 #   - no time column
 
-CSV_PATH = r"C:\Users\syw\Desktop\examine\10p00mW_2ch_3Pregain_2uL_pPDI_200uL_PS168K_3KRPM_0p2sEXP_0p4sTBF_200EM_set374p2K_10kframes_1_dricor_bsub_LD_values.csv"
+CSV_PATH = r"C:\path\to\LD_values.csv"
 
 # Time between frames (s)
 TBF = 0.4
