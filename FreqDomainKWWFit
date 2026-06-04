@@ -1,0 +1,286 @@
+# -*- coding: utf-8 -*-
+
+"""
+Load a frequency-domain susceptibility spectrum and fit it to
+a frequency-domain KWW model using HN-style weighted-linear fitting.
+
+Input CSV should contain:
+    omega_rad_per_s
+    Chi_avg
+
+Outputs:
+    *_KWWfreqfit_params.csv       KWW fit parameters
+    *_KWWfreqfit_curve.csv        Numerical fitted KWW curve
+    *_KWWfreqfit_semilogx.png     KWW fit plot
+"""
+
+# ============================================================
+# Imports
+# ============================================================
+
+from pathlib import Path
+
+import numpy as np
+import pandas as pd
+import matplotlib.pyplot as plt
+
+from scipy.optimize import curve_fit
+
+
+# ============================================================
+# User Inputs
+# ============================================================
+
+SPECTRA_FILE = r"C:\path\to\ChiLossData_omega.csv"
+
+OMEGA_COL = "omega_rad_per_s"
+CHI_COL = "Chi_avg"
+
+SAVE_PREFIX = str(
+    Path(SPECTRA_FILE).with_suffix("")
+)
+
+
+# ============================================================
+# Helper Functions
+# ============================================================
+
+u = np.logspace(-8, 6, 7000)
+
+
+def kww_chi_loss(omega, A, tau_fit, beta, b):
+
+    kernel = beta * u ** (beta - 1) * np.exp(-(u ** beta))
+    wt = np.outer(omega, tau_fit * u)
+
+    return (
+        A * np.trapz(
+            np.sin(wt) * kernel,
+            u,
+            axis=1
+        )
+        + b
+    )
+
+
+def r2_lin(y, yhat):
+
+    ss_res = np.sum((y - yhat) ** 2)
+    ss_tot = np.sum((y - np.mean(y)) ** 2)
+
+    if ss_tot <= 0:
+        return np.nan
+
+    return 1 - ss_res / ss_tot
+
+
+def load_spectrum(spectra_file, omega_col, chi_col):
+
+    df = pd.read_csv(spectra_file)
+
+    omega = df[omega_col].to_numpy(float)
+    chi = df[chi_col].to_numpy(float)
+
+    mask = (
+        np.isfinite(omega)
+        & np.isfinite(chi)
+        & (omega > 0)
+        & (chi > 0)
+    )
+
+    return omega[mask], chi[mask]
+
+
+def fit_kww_frequency(omega, chi):
+
+    omega_peak = omega[np.argmax(chi)]
+
+    p0 = [
+        np.max(chi),
+        1 / omega_peak,
+        0.7,
+        max(0.0, np.min(chi) * 0.1)
+    ]
+
+    bounds = (
+        [1e-12, 1e-12, 0.05, 0.0],
+        [np.inf, 1e8, 1.0, np.inf]
+    )
+
+    sigma = chi.copy()
+    sigma[sigma <= 0] = np.median(chi)
+
+    popt, _ = curve_fit(
+        kww_chi_loss,
+        omega,
+        chi,
+        p0=p0,
+        bounds=bounds,
+        sigma=sigma,
+        absolute_sigma=False,
+        maxfev=200000
+    )
+
+    chi_fit = kww_chi_loss(
+        omega,
+        *popt
+    )
+
+    r2 = r2_lin(
+        chi,
+        chi_fit
+    )
+
+    return popt, chi_fit, r2
+
+
+def save_fit_params(save_prefix, popt, r2):
+
+    A, tau_fit, beta, b = popt
+
+    params_df = pd.DataFrame(
+        {
+            "A": [A],
+            "tau_fit_s": [tau_fit],
+            "beta": [beta],
+            "baseline_b": [b],
+            "R2_linear": [r2]
+        }
+    )
+
+    out_params = save_prefix + "_KWWfreqfit_params.csv"
+
+    params_df.to_csv(
+        out_params,
+        index=False
+    )
+
+    print(f"Saved fit parameters to:\n{out_params}")
+
+
+def save_fit_curve(save_prefix, omega_smooth, chi_smooth):
+
+    curve_df = pd.DataFrame(
+        {
+            "omega_rad_per_s": omega_smooth,
+            "Chi_KWW_fit": chi_smooth
+        }
+    )
+
+    out_curve = save_prefix + "_KWWfreqfit_curve.csv"
+
+    curve_df.to_csv(
+        out_curve,
+        index=False
+    )
+
+    print(f"Saved fitted curve to:\n{out_curve}")
+
+
+def plot_fit(save_prefix, omega, chi, popt, r2):
+
+    A, tau_fit, beta, b = popt
+
+    omega_smooth = np.logspace(
+        np.log10(omega.min()),
+        np.log10(omega.max()),
+        2048
+    )
+
+    chi_smooth = kww_chi_loss(
+        omega_smooth,
+        *popt
+    )
+
+    save_fit_curve(
+        save_prefix,
+        omega_smooth,
+        chi_smooth
+    )
+
+    plt.figure(figsize=(5, 5))
+
+    plt.semilogx(
+        omega,
+        chi,
+        "o",
+        ms=4,
+        label="Spectrum"
+    )
+
+    plt.semilogx(
+        omega_smooth,
+        chi_smooth,
+        "-",
+        lw=2,
+        label=(
+            f"KWW fit: "
+            f"beta={beta:.3f}, "
+            f"tau={tau_fit:.3g} s, "
+            f"R2={r2:.3f}"
+        )
+    )
+
+    plt.xlabel(r"Angular frequency $\omega$ (rad/s)")
+    plt.ylabel(r"$\chi''(\omega)$ (a.u.)")
+
+    plt.legend()
+    plt.tight_layout()
+
+    fig_path = save_prefix + "_KWWfreqfit_semilogx.png"
+
+    plt.savefig(
+        fig_path,
+        dpi=300
+    )
+
+    plt.show()
+
+    print(f"Saved fit plot to:\n{fig_path}")
+
+
+# ============================================================
+# Run Analysis
+# ============================================================
+
+def main():
+
+    omega, chi = load_spectrum(
+        SPECTRA_FILE,
+        OMEGA_COL,
+        CHI_COL
+    )
+
+    popt, chi_fit, r2 = fit_kww_frequency(
+        omega,
+        chi
+    )
+
+    A, tau_fit, beta, b = popt
+
+    print("\n===== Frequency-domain KWW fit =====")
+    print(f"A        = {A:.6g}")
+    print(f"tau_fit  = {tau_fit:.6g} s")
+    print(f"beta     = {beta:.6g}")
+    print(f"b        = {b:.6g}")
+    print(f"R2       = {r2:.6g}")
+
+    save_fit_params(
+        SAVE_PREFIX,
+        popt,
+        r2
+    )
+
+    plot_fit(
+        SAVE_PREFIX,
+        omega,
+        chi,
+        popt,
+        r2
+    )
+
+    print("Analysis complete.")
+
+
+if __name__ == "__main__":
+    main()
